@@ -1,2 +1,1 @@
-# Space420-bot
-BOT ufficiale Space420
+python-telegram-bot==21.4
