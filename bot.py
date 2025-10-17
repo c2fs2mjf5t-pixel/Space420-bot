@@ -112,7 +112,7 @@ def kb_home():
 def kb_back():
     return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="home")]])
 
-HOME_TEXT = f"👋 {WELCOME_TITLE}\n\nScegli una voce dal menu qui sotto:"
+HOME_TEXT = "Scegli una voce dal menu qui sotto:"
 
 async def show_home_with_photo(chat):
     if WELCOME_PHOTO_URL:
