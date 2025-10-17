@@ -1,9 +1,10 @@
 # =====================================================
 # SPACE420OFFICIAL BOT — python-telegram-bot v21.4
-# - Benvenuto: una sola immagine con testo e bottoni
-# - Menu/Contatti: supporto 10.000+ caratteri (spezzamento automatico)
-# - "⬅️ Torna indietro": cancella l'intero blocco e torna al benvenuto
-# - SQLite utenti, comandi admin blindati, backup manuale robusto
+# - Benvenuto: 1 immagine + testo + bottoni
+# - Menu/Contatti da ENV (MENU_TEXT / CONTACTS_TEXT), 10.000+ caratteri
+# - "⬅️ Torna indietro": pulisce i messaggi e torna al benvenuto
+# - Salva utenti (SQLite), comandi admin blindati
+# - Backup manuale sicuro (API SQLite)
 # =====================================================
 
 import os
@@ -13,7 +14,6 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from io import BytesIO
-
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -37,33 +37,35 @@ logging.basicConfig(
 logger = logging.getLogger("space420")
 
 # ---------- ENV ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")           # obbligatorio
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))   # tuo ID numerico
+BOT_TOKEN = os.environ.get("BOT_TOKEN")                       # obbligatorio
+ADMIN_ID  = int(os.environ.get("ADMIN_ID", "0"))              # tuo ID numerico
 
-DB_FILE = os.environ.get("DB_FILE", "./data/users.db")
-BACKUP_DIR = os.environ.get("BACKUP_DIR", "./backup")
+DB_FILE   = os.environ.get("DB_FILE", "./data/users.db")
+BACKUP_DIR= os.environ.get("BACKUP_DIR", "./backup")
 
-# Immagine e testi (puoi cambiarli via ENV se vuoi)
-WELCOME_PHOTO_URL = os.environ.get(
-    "WELCOME_PHOTO_URL",
-    "https://i.postimg.cc/D0JhvYfw/1230-DD1-F-7504-4131-8-F96-FA4398-A29-B39.jpg"
-).strip()
-
+WELCOME_PHOTO_URL = (os.environ.get("WELCOME_PHOTO_URL") or
+    "https://i.postimg.cc/D0JhvYfw/1230-DD1-F-7504-4131-8-F96-FA4398-A29-B39.jpg").strip()
 WELCOME_TITLE = os.environ.get(
-    "WELCOME_TITLE",
-    "BENVENUTI NEL SPACE CLUB 🇺🇸🇪🇸🇲🇦🇮🇹🇳🇱"
+    "WELCOME_TITLE", "BENVENUTI NEL SPACE CLUB 🇺🇸🇪🇸🇲🇦🇮🇹🇳🇱"
 )
 
-# Testi del menu/contatti (puoi metterli anche da ENV; supporta 10k+ char)
-MENU_TEXT = os.environ.get("MENU_TEXT", "#MENU qui il tuo testo lungo…")
-CONTACTS_TEXT = os.environ.get("CONTACTS_TEXT", "Contatti e link…")
+# ---------- TESTI MENU/CONTATTI presi dalle ENV ----------
+DEFAULT_MENU = """#MENU (default)
+Imposta il testo del menù nella variabile d'ambiente MENU_TEXT su Render.
+"""
+DEFAULT_CONTACTS = """Contatti (default)
+Imposta i contatti nella variabile d'ambiente CONTACTS_TEXT su Render.
+"""
 
-# Etichette pulsanti
-BTN_MENU = os.environ.get("BTN_MENU", "📖 Menù")
+MENU_TEXT     = (os.environ.get("MENU_TEXT") or "").strip() or DEFAULT_MENU
+CONTACTS_TEXT = (os.environ.get("CONTACTS_TEXT") or "").strip() or DEFAULT_CONTACTS
+
+# ---------- LABEL BOTTONI ----------
+BTN_MENU     = os.environ.get("BTN_MENU", "📖 Menù")
 BTN_CONTACTS = os.environ.get("BTN_CONTACTS", "📲 Contatti")
-BTN_BACK = os.environ.get("BTN_BACK", "⬅️ Torna indietro")
+BTN_BACK     = os.environ.get("BTN_BACK", "⬅️ Torna indietro")
 
-# Key per tracciare i messaggi aperti per utente
+# Chiave per tenere traccia dei messaggi inviati per il menu/contatti
 OPEN_KEY = "open_msgs_ids"
 
 # ---------- DB ----------
@@ -73,15 +75,13 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
+        """CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
             last_name TEXT,
             joined_utc TEXT
-        )
-        """
+        )"""
     )
     conn.commit()
     conn.close()
@@ -105,9 +105,9 @@ def add_user_if_new(user):
     conn.close()
 
 def is_admin(uid: int) -> bool:
-    return uid == ADMIN_ID and uid != 0
+    return uid != 0 and uid == ADMIN_ID
 
-# ---------- BACKUP (robusto via API SQLite) ----------
+# ---------- BACKUP (API SQLite, consistente) ----------
 def make_backup_copy(src: str, dest_dir: str) -> Path:
     Path(dest_dir).mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -124,52 +124,41 @@ def make_backup_copy(src: str, dest_dir: str) -> Path:
 
 # ---------- UI ----------
 def kb_home() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(BTN_MENU, callback_data="open_menu"),
-            InlineKeyboardButton(BTN_CONTACTS, callback_data="open_contacts"),
-        ]]
-    )
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(BTN_MENU, callback_data="open_menu"),
+        InlineKeyboardButton(BTN_CONTACTS, callback_data="open_contacts"),
+    ]])
 
 def kb_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="home")]])
 
 async def show_home_with_photo(chat):
-    """Mostra una sola immagine con la scritta e i pulsanti sotto (nessun doppio messaggio)."""
+    """Mostra una sola immagine con la scritta e i bottoni (nessun doppio messaggio)."""
+    caption = f"{WELCOME_TITLE}\n\nScegli una voce dal menu qui sotto:"
     if WELCOME_PHOTO_URL:
-        await chat.send_photo(
-            photo=WELCOME_PHOTO_URL,
-            caption=f"{WELCOME_TITLE}\n\nScegli una voce dal menu qui sotto:",
-            reply_markup=kb_home(),
-        )
+        await chat.send_photo(photo=WELCOME_PHOTO_URL, caption=caption, reply_markup=kb_home())
     else:
-        await chat.send_message(
-            text=f"{WELCOME_TITLE}\n\nScegli una voce dal menu qui sotto:",
-            reply_markup=kb_home(),
-        )
+        await chat.send_message(text=caption, reply_markup=kb_home())
 
-# ---------- Text chunking (10k+ caratteri) ----------
+# ---------- Gestione testi lunghi ----------
 def _chunks(s: str, size: int = 3800):
     """Spezzetta il testo in blocchi sotto il limite Telegram (~4096)."""
-    i = 0
-    n = len(s)
-    while i < n:
+    for i in range(0, len(s), size):
         yield s[i:i+size]
-        i += size
 
 async def send_long_with_back(update_or_chat, context, text: str):
     """Invia testo lunghissimo a pezzi e salva gli ID per cancellarli al 'Back'."""
-    # ricava chat e user_data
-    if hasattr(update_or_chat, "effective_chat"):
+    if hasattr(update_or_chat, "effective_chat") and update_or_chat.effective_chat:
         chat = update_or_chat.effective_chat
-        user_data = context.user_data
+    elif hasattr(update_or_chat, "message") and hasattr(update_or_chat.message, "chat"):
+        chat = update_or_chat.message.chat
     else:
-        chat = update_or_chat
-        user_data = context.user_data
+        chat = update_or_chat  # assume già Chat
 
+    user_data = context.user_data
     sent_ids = []
     parts = list(_chunks(text, 3800))
-    if not parts:
+    if not parts:  # niente da inviare
         return
 
     for p in parts[:-1]:
@@ -178,7 +167,6 @@ async def send_long_with_back(update_or_chat, context, text: str):
 
     last = await chat.send_message(parts[-1], reply_markup=kb_back())
     sent_ids.append(last.message_id)
-
     user_data[OPEN_KEY] = sent_ids
 
 async def delete_open_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -192,17 +180,16 @@ async def delete_open_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     context.user_data[OPEN_KEY] = []
 
-# ---------- CALLBACKS ----------
+# ---------- CALLBACK bottoni ----------
 async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     try:
         if q.data == "open_menu":
-            await send_long_with_back(q, context, MENU_TEXT)
+            await send_long_with_back(update, context, MENU_TEXT)
         elif q.data == "open_contacts":
-            await send_long_with_back(q, context, CONTACTS_TEXT)
+            await send_long_with_back(update, context, CONTACTS_TEXT)
         elif q.data == "home":
-            # cancella tutto il blocco aperto e torna al benvenuto
             await delete_open_block(update, context)
             try:
                 await q.message.delete()
@@ -212,7 +199,7 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"on_buttons error: {e}")
 
-# ---------- COMMANDS (UTENTE) ----------
+# ---------- COMANDI UTENTE ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         add_user_if_new(update.effective_user)
@@ -235,7 +222,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
     await update.message.reply_text(f"ID: {uid}\nAdmin: {'SI' if is_admin(uid) else 'NO'}")
 
-# ---------- COMMANDS (ADMIN — blindati) ----------
+# ---------- COMANDI ADMIN (blindati: nessuna risposta ai non-admin) ----------
 async def cmd_backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     p = make_backup_copy(DB_FILE, BACKUP_DIR)
@@ -249,30 +236,28 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cur.fetchall()
     conn.close()
     buf = BytesIO()
-    w = csv.writer(buf)
-    w.writerow(["user_id", "username", "first_name", "last_name", "joined_utc"])
-    w.writerows(rows)
+    writer = csv.writer(buf)
+    writer.writerow(["user_id", "username", "first_name", "last_name", "joined_utc"])
+    writer.writerows(rows)
     buf.seek(0)
     await update.message.reply_document(
         InputFile(buf, filename="users_export.csv"),
-        caption="Esportazione utenti (CSV)"
+        caption="Esportazione utenti (CSV)",
     )
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("SELECT user_id, username, first_name, last_name, joined_utc "
-                "FROM users ORDER BY joined_utc DESC LIMIT 100")
+    cur.execute("SELECT user_id, username, first_name FROM users ORDER BY joined_utc DESC LIMIT 100")
     rows = cur.fetchall()
     conn.close()
     if not rows:
         await update.message.reply_text("Nessun utente.")
         return
-    lines = ["Ultimi 100 iscritti:"]
-    for uid, un, fn, ln, ts in rows:
-        lines.append(f"- {uid} @{un or '-'} — {fn or ''} {ln or ''} — {ts}")
-    # spezza anche la lista se lunghissima
+    lines = ["📜 Ultimi utenti registrati:\n"]
+    for uid, un, fn in rows:
+        lines.append(f"• {fn or '-'} @{un or '-'} (ID: {uid})")
     for part in _chunks("\n".join(lines), 3800):
         await update.message.reply_text(part)
 
@@ -284,19 +269,17 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Comandi
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("whoami", cmd_whoami))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("utenti", cmd_utenti))
+    # Handlers
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CallbackQueryHandler(on_buttons))
+    app.add_handler(CommandHandler("utenti",  cmd_utenti))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("whoami",  cmd_whoami))
 
     # Admin (blindati)
     app.add_handler(CommandHandler("backup_db", cmd_backup_db))
-    app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("list", cmd_list))
-
-    # Pulsanti
-    app.add_handler(CallbackQueryHandler(on_buttons))
+    app.add_handler(CommandHandler("export",    cmd_export))
+    app.add_handler(CommandHandler("list",      cmd_list))
 
     # Testo libero → torna al benvenuto
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
