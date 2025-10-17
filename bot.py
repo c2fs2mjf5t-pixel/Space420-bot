@@ -1,8 +1,8 @@
 # =====================================================
 # bot.py — Space420 (python-telegram-bot v21.4)
 # SQLite + Inline menu con "⬅️ Torna al menu"
-# Admin blindati: /list /export /backup_db /broadcast (silenziosi per non-admin)
-# Backup manuale + notturno, Anti-conflict (webhook cleanup & retry)
+# Admin blindati + /whoami + backup manuale robusto + backup notturno
+# Anti-conflict (webhook cleanup & retry) — Render Background Worker
 # =====================================================
 
 import os
@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 import telegram.error as tgerr
 
-VERSION = "Space420-BackNav-ADMINLOCK-1.0"
+VERSION = "Space420-ADMINLOCK-BACKUPv2"
 
 # ---------- LOG ----------
 logging.basicConfig(
@@ -37,7 +37,6 @@ log = logging.getLogger("space420")
 
 # ---------- ENV ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")  # OBBLIGATORIO
-
 DB_FILE = os.environ.get("DB_FILE", "./data/users.db")
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "./backup")
 BACKUP_TIME = os.environ.get("BACKUP_TIME", "03:00")   # HH:MM (UTC su Render)
@@ -49,13 +48,13 @@ WELCOME_PHOTO_URL = os.environ.get(
 ).strip()
 WELCOME_TITLE = os.environ.get(
     "WELCOME_TITLE",
-    "BENVENUTO NEL CLUB SPACE OFFICIAL 🇮🇹🇲🇦🇺🇸🇪🇸",
+    "BENVENUTO NEL SPACE CLUB OFFICIAL 🇮🇹🇲🇦🇺🇸🇪🇸",
 )
 
-# Testi (inserire contenuti leciti)
+# Testi (metti contenuti leciti)
 MENU_TEXT = os.environ.get(
     "MENU_TEXT",
-    "📖 Menù — inserisci qui un testo lecito: descrizioni, regole, orari, novità."
+    "📖 Menù — inserisci qui testo lecito: descrizioni, regole, orari, novità."
 )
 CONTACTS_TEXT = os.environ.get(
     "CONTACTS_TEXT",
@@ -129,7 +128,7 @@ def kb_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="home")]])
 
 async def send_long(chat, text: str):
-    MAX = 3900
+    MAX = 3900  # sotto il limite 4096
     if len(text) <= MAX:
         await chat.send_message(text)
         return
@@ -184,9 +183,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🕓 Server UTC: {tnow}"
     )
 
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else None
+    await update.message.reply_text(f"ID: {uid}\nAdmin: {'SI' if is_admin(uid) else 'NO'}")
+
 # ---------- ADMIN GUARD (silenziosa) ----------
 async def guard_admin(update: Update) -> bool:
-    """Ritorna True se è admin; se NON è admin, non manda nulla e ritorna False."""
     uid = (update.effective_user.id if update and update.effective_user else None)
     return bool(uid and is_admin(uid))
 
@@ -223,10 +225,22 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(InputFile(str(out)), filename=out.name,
                                         caption="Esportazione utenti (CSV)")
 
+# ===== BACKUP CONSISTENTE (API SQLite) =====
 async def make_backup_copy(src: str, dest_dir: str) -> Path:
+    """Backup consistente usando l'API di backup di SQLite (no lock/corruzione)."""
     Path(dest_dir).mkdir(parents=True, exist_ok=True)
-    dest = Path(dest_dir) / f"users_backup_{datetime.now():%Y%m%d_%H%M%S}.db"
-    shutil.copy2(src, dest)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = Path(dest_dir) / f"users_backup_{ts}.db"
+
+    src_conn = sqlite3.connect(src)
+    dst_conn = sqlite3.connect(dest)
+    try:
+        with dst_conn:
+            src_conn.backup(dst_conn)  # copia consistente a caldo
+    finally:
+        dst_conn.close()
+        src_conn.close()
+
     return dest
 
 async def cmd_backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -259,7 +273,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ko += 1
     await update.message.reply_text(f"Broadcast: ✅ {ok} • ❌ {ko}")
 
-# ---------- HELP: mostra admin solo all'admin ----------
+# ---------- HELP (admin visibili solo all'admin) ----------
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     base = (
         "/start — Benvenuto e menu\n"
@@ -267,6 +281,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/contatti — Mostra Contatti\n"
         "/utenti — Numero registrati\n"
         "/status — Stato del bot\n"
+        "/whoami — Mostra il tuo ID e se sei admin\n"
     )
     admin = (
         "\nComandi admin:\n"
@@ -340,6 +355,7 @@ def main():
     app.add_handler(CommandHandler("contatti", cmd_contatti))
     app.add_handler(CommandHandler("utenti", cmd_utenti))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("help", cmd_help))
 
     # Admin (blindati)
@@ -352,7 +368,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
 
-    log.info("Space420 pronto — LONG POLLING (admin blindati)")
+    log.info("Space420 pronto — LONG POLLING (admin blindati, backup robusto)")
     run_polling_with_guard(app)
 
 if __name__ == "__main__":
