@@ -4,7 +4,7 @@
 # - Menu/Contatti da ENV (MENU_TEXT / CONTACTS_TEXT), 10.000+ caratteri
 # - "⬅️ Torna indietro": pulisce i messaggi e torna al benvenuto
 # - Salva utenti (SQLite), comandi admin blindati
-# - Backup manuale sicuro (API SQLite)
+# - Backup manuale sicuro (API SQLite) — FIX invio file
 # =====================================================
 
 import os
@@ -14,6 +14,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from io import BytesIO
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -28,7 +29,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import telegram.error as tgerr
 
 # ---------- LOG ----------
 logging.basicConfig(
@@ -224,29 +224,46 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- COMANDI ADMIN (blindati: nessuna risposta ai non-admin) ----------
 async def cmd_backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    p = make_backup_copy(DB_FILE, BACKUP_DIR)
-    await update.message.reply_document(InputFile(p), caption=f"Backup creato: {p.name}")
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        p = make_backup_copy(DB_FILE, BACKUP_DIR)
+        # FIX: invio file aprendo in binario (compat 100%)
+        with open(p, "rb") as fh:
+            await update.message.reply_document(
+                document=fh,
+                filename=p.name,
+                caption=f"Backup creato: {p.name}",
+            )
+    except Exception as e:
+        # feedback solo all'admin
+        await update.message.reply_text(f"Errore backup: {e}")
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, username, first_name, last_name, joined_utc FROM users")
-    rows = cur.fetchall()
-    conn.close()
-    buf = BytesIO()
-    writer = csv.writer(buf)
-    writer.writerow(["user_id", "username", "first_name", "last_name", "joined_utc"])
-    writer.writerows(rows)
-    buf.seek(0)
-    await update.message.reply_document(
-        InputFile(buf, filename="users_export.csv"),
-        caption="Esportazione utenti (CSV)",
-    )
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, first_name, last_name, joined_utc FROM users")
+        rows = cur.fetchall()
+        conn.close()
+        buf = BytesIO()
+        writer = csv.writer(buf)
+        writer.writerow(["user_id", "username", "first_name", "last_name", "joined_utc"])
+        writer.writerows(rows)
+        buf.seek(0)
+        await update.message.reply_document(
+            document=buf,
+            filename="users_export.csv",
+            caption="Esportazione utenti (CSV)",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Errore export: {e}")
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update.effective_user.id):
+        return
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT user_id, username, first_name FROM users ORDER BY joined_utc DESC LIMIT 100")
