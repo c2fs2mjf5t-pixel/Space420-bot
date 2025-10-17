@@ -44,7 +44,7 @@ WELCOME_PHOTO_URL = os.environ.get(
     "WELCOME_PHOTO_URL",
     "https://i.postimg.cc/D0JhvYfw/1230-DD1-F-7504-4131-8-F96-FA4398-A29-B39.jpg",
 )
-WELCOME_TITLE = "BENVENUTO NEL SPACE CLUB OFFICIAL 🇮🇹🇲🇦🇺🇸🇪🇸"
+WELCOME_TITLE = "PER AVVIARE IL BOT DIGITA /start"
 
 # ===== BUTTON LABELS =====
 BTN_MENU = "📖 Menù"
