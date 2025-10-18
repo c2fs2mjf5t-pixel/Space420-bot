@@ -4,21 +4,24 @@
 # ✅ Benvenuto con immagine + pulsanti (Menù / Contatti)
 # ✅ Testi lunghissimi (10.000+ caratteri) da variabili ENV
 # ✅ "⬅️ Torna indietro" pulisce i messaggi
-# ✅ Salvataggio automatico utenti (SQLite)
-# ✅ Comandi admin blindati in chat privata
-# ✅ Backup + Export + List + Broadcast
-# ✅ Anti-conflict (polling sicuro, retry automatico)
+# ✅ Salvataggio utenti (SQLite)
+# ✅ Admin-only in chat privata: status, backup, export (CSV/JSON/XLSX), list, broadcast
+# ✅ Auto-backup giornaliero (UTC) + retention (pulizia backup vecchi)
+# ✅ Anti-conflict (delete_webhook + polling retry)
 # =====================================================
 
 import os
 import csv
+import json
+import glob
 import sqlite3
 import logging
 import asyncio as aio
 from time import sleep
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dtime, timedelta
 from pathlib import Path
 from io import BytesIO
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -34,6 +37,9 @@ from telegram.ext import (
     filters,
 )
 import telegram.error as tgerr
+
+# XLSX
+from openpyxl import Workbook
 
 # ---------- LOG ----------
 logging.basicConfig(
@@ -53,6 +59,11 @@ WELCOME_PHOTO_URL = (os.environ.get("WELCOME_PHOTO_URL") or
 WELCOME_TITLE = os.environ.get(
     "WELCOME_TITLE", "BENVENUTI NEL SPACE CLUB 🇺🇸🇪🇸🇲🇦🇮🇹🇳🇱"
 )
+
+# Auto-backup (UTC) + retention + notifica admin
+BACKUP_TIME           = os.environ.get("BACKUP_TIME", "03:00")  # HH:MM (UTC)
+BACKUP_NOTIFY_ADMIN   = os.environ.get("BACKUP_NOTIFY_ADMIN", "0")  # "1" per notificare
+BACKUP_RETENTION_DAYS = int(os.environ.get("BACKUP_RETENTION_DAYS", "14"))
 
 # ---------- MENU / CONTATTI ----------
 DEFAULT_MENU = "#MENU (default)\nImposta la variabile d'ambiente MENU_TEXT su Render."
@@ -106,6 +117,7 @@ def add_user_if_new(user):
         conn.commit()
     conn.close()
 
+# ---------- BACKUP + RETENTION ----------
 def make_backup_copy(src: str, dest_dir: str) -> Path:
     Path(dest_dir).mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -113,9 +125,25 @@ def make_backup_copy(src: str, dest_dir: str) -> Path:
     src_conn = sqlite3.connect(src)
     dst_conn = sqlite3.connect(dest)
     with dst_conn:
-        src_conn.backup(dst_conn)
+        src_conn.backup(dst_conn)  # copia consistente anche a caldo
     dst_conn.close(); src_conn.close()
     return dest
+
+def cleanup_old_backups(dest_dir: str, retention_days: int):
+    try:
+        cutoff = datetime.now() - timedelta(days=retention_days)
+        for path in glob.glob(str(Path(dest_dir) / "users_backup_*.db")):
+            p = Path(path)
+            if datetime.fromtimestamp(p.stat().st_mtime) < cutoff:
+                p.unlink(missing_ok=True)
+        # anche csv/json/xlsx esportati vecchi
+        for pattern in ["users_export_*.csv", "users_export_*.json", "users_export_*.xlsx"]:
+            for path in glob.glob(str(Path(dest_dir) / pattern)):
+                p = Path(path)
+                if datetime.fromtimestamp(p.stat().st_mtime) < cutoff:
+                    p.unlink(missing_ok=True)
+    except Exception as e:
+        logger.warning(f"cleanup_old_backups: {e}")
 
 # ---------- INTERFACCIA ----------
 def kb_home():
@@ -123,6 +151,7 @@ def kb_home():
         InlineKeyboardButton(BTN_MENU, callback_data="open_menu"),
         InlineKeyboardButton(BTN_CONTACTS, callback_data="open_contacts"),
     ]])
+
 def kb_back():
     return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="home")]])
 
@@ -195,7 +224,14 @@ async def cmd_whoami(update, context):
 async def cmd_adminstatus(update, context):
     if not admin_only_private(update): return
     n = sqlite3.connect(DB_FILE).execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    await update.message.reply_text(f"🔐 Admin Status\n🗂 DB: {DB_FILE}\n📦 Backup: {BACKUP_DIR}\n👥 Utenti: {n}")
+    await update.message.reply_text(
+        f"🔐 Admin Status\n"
+        f"🗂 DB: {DB_FILE}\n"
+        f"📦 Backup: {BACKUP_DIR}\n"
+        f"⏰ Auto-backup (UTC): {BACKUP_TIME}\n"
+        f"🧹 Retention: {BACKUP_RETENTION_DAYS} giorni\n"
+        f"👥 Utenti: {n}"
+    )
 
 async def cmd_backup_db(update, context):
     if not admin_only_private(update): return
@@ -204,22 +240,94 @@ async def cmd_backup_db(update, context):
         await update.message.reply_document(document=fh, filename=p.name, caption=f"Backup creato: {p.name}")
 
 async def cmd_export(update, context):
+    # CSV su disco + invio
     if not admin_only_private(update): return
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor(); cur.execute("SELECT * FROM users")
-    rows = cur.fetchall(); conn.close()
-    buf = BytesIO(); w = csv.writer(buf)
-    w.writerow(["user_id","username","first_name","last_name","joined_utc"]); w.writerows(rows)
-    buf.seek(0)
-    await update.message.reply_document(document=buf, filename="users.csv", caption="Esportazione utenti")
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, first_name, last_name, joined_utc FROM users")
+        rows = cur.fetchall()
+        conn.close()
+
+        Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = Path(BACKUP_DIR) / f"users_export_{ts}.csv"
+
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["user_id","username","first_name","last_name","joined_utc"])
+            w.writerows(rows)
+
+        with open(csv_path, "rb") as fh:
+            await update.message.reply_document(document=fh, filename=csv_path.name,
+                                                caption=f"Esportazione utenti: {csv_path.name}")
+    except Exception as e:
+        await update.message.reply_text(f"Errore export: {e}")
+
+async def cmd_export_json(update, context):
+    if not admin_only_private(update): return
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, first_name, last_name, joined_utc FROM users")
+        rows = cur.fetchall()
+        conn.close()
+
+        data = [
+            {"user_id": r[0], "username": r[1], "first_name": r[2], "last_name": r[3], "joined_utc": r[4]}
+            for r in rows
+        ]
+
+        Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = Path(BACKUP_DIR) / f"users_export_{ts}.json"
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        with open(json_path, "rb") as fh:
+            await update.message.reply_document(document=fh, filename=json_path.name,
+                                                caption=f"Export JSON: {json_path.name}")
+    except Exception as e:
+        await update.message.reply_text(f"Errore export JSON: {e}")
+
+async def cmd_export_xlsx(update, context):
+    if not admin_only_private(update): return
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, first_name, last_name, joined_utc FROM users")
+        rows = cur.fetchall()
+        conn.close()
+
+        Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        xlsx_path = Path(BACKUP_DIR) / f"users_export_{ts}.xlsx"
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Utenti"
+        ws.append(["user_id","username","first_name","last_name","joined_utc"])
+        for r in rows:
+            ws.append(list(r))
+        wb.save(xlsx_path)
+
+        with open(xlsx_path, "rb") as fh:
+            await update.message.reply_document(document=fh, filename=xlsx_path.name,
+                                                caption=f"Export XLSX: {xlsx_path.name}")
+    except Exception as e:
+        await update.message.reply_text(f"Errore export XLSX: {e}")
 
 async def cmd_list(update, context):
     if not admin_only_private(update): return
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT user_id, username, first_name FROM users ORDER BY joined_utc DESC LIMIT 100")
-    rows = cur.fetchall(); conn.close()
-    if not rows: await update.message.reply_text("Nessun utente."); return
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("Nessun utente.")
+        return
     msg = "\n".join(f"• {fn or '-'} @{un or '-'} (ID: {uid})" for uid,un,fn in rows)
     for part in _chunks(msg,3800): await update.message.reply_text(part)
 
@@ -238,9 +346,41 @@ async def cmd_broadcast(update, context):
         try:
             await context.bot.send_message(chat_id=uid, text=text)
             ok+=1
+            await aio.sleep(0.03)  # rate limit dolce
+        except:
+            ko+=1
             await aio.sleep(0.03)
-        except: ko+=1; await aio.sleep(0.03)
     await update.message.reply_text(f"Broadcast finito: ✅{ok} | ❌{ko}")
+
+# ---------- AUTO-BACKUP GIORNALIERO ----------
+def _parse_hhmm(s: str) -> dtime:
+    try:
+        h, m = s.split(":"); return dtime(hour=int(h), minute=int(m))
+    except:
+        return dtime(3, 0)  # default 03:00 UTC
+
+async def nightly_backup_task(app: Application):
+    target = _parse_hhmm(BACKUP_TIME)
+    logger.info(f"Task auto-backup attivo — orario (UTC): {target.strftime('%H:%M')}")
+    while True:
+        now = datetime.utcnow()
+        today_target = datetime.combine(now.date(), target)
+        if now >= today_target:
+            today_target += timedelta(days=1)
+        wait_sec = (today_target - now).total_seconds()
+        await aio.sleep(wait_sec)
+        try:
+            p = make_backup_copy(DB_FILE, BACKUP_DIR)
+            cleanup_old_backups(BACKUP_DIR, BACKUP_RETENTION_DAYS)
+            logger.info(f"Auto-backup creato: {p}")
+            if BACKUP_NOTIFY_ADMIN == "1" and ADMIN_ID:
+                try:
+                    await app.bot.send_message(chat_id=ADMIN_ID, text=f"✅ Auto-backup creato: {p.name}")
+                except Exception as e:
+                    logger.warning(f"Notify admin failed: {e}")
+        except Exception as e:
+            logger.error(f"Auto-backup errore: {e}")
+        await aio.sleep(60)  # piccolo buffer
 
 # ---------- ANTI-CONFLICT ----------
 async def ensure_no_webhook(app: Application):
@@ -252,6 +392,9 @@ async def ensure_no_webhook(app: Application):
 
 def run_polling_with_guard(app: Application):
     loop = aio.get_event_loop()
+    # avvia task auto-backup
+    loop.create_task(nightly_backup_task(app))
+    # anti-conflict
     loop.run_until_complete(ensure_no_webhook(app))
     while True:
         try:
@@ -275,15 +418,17 @@ def main():
     app.add_handler(CommandHandler("utenti", cmd_utenti))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
-    # admin
+    # admin (solo privato)
     app.add_handler(CommandHandler("adminstatus", cmd_adminstatus))
     app.add_handler(CommandHandler("backup_db", cmd_backup_db))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("export_json", cmd_export_json))
+    app.add_handler(CommandHandler("export_xlsx", cmd_export_xlsx))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     # default
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
-    logger.info("SPACE420OFFICIAL avviato con anti-conflict.")
+    logger.info("SPACE420OFFICIAL avviato — anti-conflict + auto-backup.")
     run_polling_with_guard(app)
 
 if __name__ == "__main__":
