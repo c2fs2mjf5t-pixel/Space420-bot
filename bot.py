@@ -42,8 +42,6 @@ from telegram.ext import (
     filters,
 )
 import telegram.error as tgerr
-
-# XLSX
 from openpyxl import Workbook
 
 # ---------- LOG ----------
@@ -92,7 +90,6 @@ def is_private(update: Update) -> bool:
     return bool(chat and chat.type == "private")
 
 def admin_only_private(update: Update) -> bool:
-    """True se è l’admin e scrive in chat privata."""
     user = update.effective_user
     return bool(user and is_admin(user.id) and is_private(update))
 
@@ -141,7 +138,6 @@ def cleanup_old_backups(dest_dir: str, retention_days: int):
             p = Path(path)
             if datetime.fromtimestamp(p.stat().st_mtime) < cutoff:
                 p.unlink(missing_ok=True)
-        # anche csv/json/xlsx esportati vecchi
         for pattern in ["users_export_*.csv", "users_export_*.json", "users_export_*.xlsx"]:
             for path in glob.glob(str(Path(dest_dir) / pattern)):
                 p = Path(path)
@@ -227,7 +223,7 @@ async def cmd_whoami(update, context):
 
 # ---------- BLOCCO MEDIA UTENTI (non admin) ----------
 async def block_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancella foto/video/documenti/voice inviati da non-admin."""
+    """Cancella foto/video/documenti/voice/animazioni/sticker inviati da non-admin."""
     u = update.effective_user
     if u and is_admin(u.id):
         return
@@ -258,7 +254,6 @@ async def cmd_backup_db(update, context):
         await update.message.reply_document(document=fh, filename=p.name, caption=f"Backup creato: {p.name}", protect_content=True)
 
 async def cmd_export(update, context):
-    # CSV su disco + invio
     if not admin_only_private(update): return
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -289,7 +284,7 @@ async def cmd_export_json(update, context):
         conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
         cur.execute("SELECT user_id, username, first_name, last_name, joined_utc FROM users")
-        rows = conn.cursor().fetchall() if False else rows  # placeholder per coerenza
+        rows = cur.fetchall()
         conn.close()
 
         data = [
@@ -367,7 +362,7 @@ async def cmd_broadcast(update, context):
         try:
             await context.bot.send_message(chat_id=uid, text=text, protect_content=True)
             ok+=1
-            await aio.sleep(0.03)  # rate limit dolce
+            await aio.sleep(0.03)
         except:
             ko+=1
             await aio.sleep(0.03)
@@ -432,7 +427,7 @@ def _parse_hhmm(s: str) -> dtime:
     try:
         h, m = s.split(":"); return dtime(hour=int(h), minute=int(m))
     except:
-        return dtime(3, 0)  # default 03:00 UTC
+        return dtime(3, 0)
 
 async def nightly_backup_task(app: Application):
     target = _parse_hhmm(BACKUP_TIME)
@@ -455,7 +450,7 @@ async def nightly_backup_task(app: Application):
                     logger.warning(f"Notify admin failed: {e}")
         except Exception as e:
             logger.error(f"Auto-backup errore: {e}")
-        await aio.sleep(60)  # piccolo buffer
+        await aio.sleep(60)
 
 # ---------- ANTI-CONFLICT ----------
 async def ensure_no_webhook(app: Application):
@@ -467,9 +462,7 @@ async def ensure_no_webhook(app: Application):
 
 def run_polling_with_guard(app: Application):
     loop = aio.get_event_loop()
-    # avvia task auto-backup
     loop.create_task(nightly_backup_task(app))
-    # anti-conflict
     loop.run_until_complete(ensure_no_webhook(app))
     while True:
         try:
@@ -502,16 +495,16 @@ def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("restore_db", cmd_restore_db))
-    # blocco media non-admin (foto/video/documenti/voice/sticker/audio/gif/video_note)
+    # blocco media non-admin (foto/video/documenti/voice/animazioni/audio/gif/video_note, sticker inclusi)
     media_filter = (
         filters.PHOTO
         | filters.VIDEO
         | filters.Document.ALL
         | filters.ANIMATION
-        | filters.STICKER
         | filters.AUDIO
         | filters.VOICE
         | filters.VIDEO_NOTE
+        | filters.ATTACHMENT   # <-- sostituisce STICKER (v21+)
     )
     app.add_handler(MessageHandler(media_filter, block_media))
     # default (testi non comando → mostra home)
