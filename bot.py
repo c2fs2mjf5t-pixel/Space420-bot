@@ -8,6 +8,9 @@
 # ✅ Admin-only in chat privata: status, backup, export (CSV/JSON/XLSX), list, broadcast
 # ✅ Auto-backup giornaliero (UTC) + retention (pulizia backup vecchi)
 # ✅ Anti-conflict (delete_webhook + polling retry)
+# ✅ Anti-share: protect_content=True su tutti gli invii del bot
+# ✅ Blocca media degli utenti (foto/video/file) se non admin
+# ✅ /restore_db: ripristino DB rispondendo a un file .db
 # =====================================================
 
 import os
@@ -21,11 +24,13 @@ from time import sleep
 from datetime import datetime, timezone, time as dtime, timedelta
 from pathlib import Path
 from io import BytesIO
+import shutil
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -157,7 +162,7 @@ def kb_back():
 
 async def show_home_with_photo(chat):
     caption = f"{WELCOME_TITLE}\n\nScegli una voce dal menu qui sotto:"
-    await chat.send_photo(photo=WELCOME_PHOTO_URL, caption=caption, reply_markup=kb_home())
+    await chat.send_photo(photo=WELCOME_PHOTO_URL, caption=caption, reply_markup=kb_home(), protect_content=True)
 
 def _chunks(s: str, size: int = 3800):
     for i in range(0, len(s), size): yield s[i:i+size]
@@ -173,9 +178,9 @@ async def send_long_with_back(update_or_chat, context, text: str):
     parts = list(_chunks(text, 3800))
     if not parts: return
     for p in parts[:-1]:
-        m = await chat.send_message(p)
+        m = await chat.send_message(p, protect_content=True)
         sent_ids.append(m.message_id)
-    last = await chat.send_message(parts[-1], reply_markup=kb_back())
+    last = await chat.send_message(parts[-1], reply_markup=kb_back(), protect_content=True)
     sent_ids.append(last.message_id)
     context.user_data[OPEN_KEY] = sent_ids
 
@@ -211,14 +216,26 @@ async def cmd_start(update, context):
 
 async def cmd_utenti(update, context):
     n = sqlite3.connect(DB_FILE).execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    await update.message.reply_text(f"👥 Utenti registrati: {n}")
+    await update.message.reply_text(f"👥 Utenti registrati: {n}", protect_content=True)
 
 async def cmd_status(update, context):
-    await update.message.reply_text("✅ Bot attivo")
+    await update.message.reply_text("✅ Bot attivo", protect_content=True)
 
 async def cmd_whoami(update, context):
     uid = update.effective_user.id
-    await update.message.reply_text(f"ID: {uid}\nAdmin: {'SI' if is_admin(uid) else 'NO'}")
+    await update.message.reply_text(f"ID: {uid}\nAdmin: {'SI' if is_admin(uid) else 'NO'}", protect_content=True)
+
+# ---------- BLOCCO MEDIA UTENTI (non admin) ----------
+async def block_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancella foto/video/documenti/voice inviati da non-admin."""
+    u = update.effective_user
+    if u and is_admin(u.id):
+        return
+    chat = update.effective_chat
+    try:
+        await context.bot.delete_message(chat_id=chat.id, message_id=update.effective_message.id)
+    except Exception:
+        pass
 
 # ---------- COMANDI ADMIN (solo privato) ----------
 async def cmd_adminstatus(update, context):
@@ -230,14 +247,15 @@ async def cmd_adminstatus(update, context):
         f"📦 Backup: {BACKUP_DIR}\n"
         f"⏰ Auto-backup (UTC): {BACKUP_TIME}\n"
         f"🧹 Retention: {BACKUP_RETENTION_DAYS} giorni\n"
-        f"👥 Utenti: {n}"
+        f"👥 Utenti: {n}",
+        protect_content=True
     )
 
 async def cmd_backup_db(update, context):
     if not admin_only_private(update): return
     p = make_backup_copy(DB_FILE, BACKUP_DIR)
     with open(p, "rb") as fh:
-        await update.message.reply_document(document=fh, filename=p.name, caption=f"Backup creato: {p.name}")
+        await update.message.reply_document(document=fh, filename=p.name, caption=f"Backup creato: {p.name}", protect_content=True)
 
 async def cmd_export(update, context):
     # CSV su disco + invio
@@ -260,9 +278,10 @@ async def cmd_export(update, context):
 
         with open(csv_path, "rb") as fh:
             await update.message.reply_document(document=fh, filename=csv_path.name,
-                                                caption=f"Esportazione utenti: {csv_path.name}")
+                                                caption=f"Esportazione utenti: {csv_path.name}",
+                                                protect_content=True)
     except Exception as e:
-        await update.message.reply_text(f"Errore export: {e}")
+        await update.message.reply_text(f"Errore export: {e}", protect_content=True)
 
 async def cmd_export_json(update, context):
     if not admin_only_private(update): return
@@ -270,7 +289,7 @@ async def cmd_export_json(update, context):
         conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
         cur.execute("SELECT user_id, username, first_name, last_name, joined_utc FROM users")
-        rows = cur.fetchall()
+        rows = conn.cursor().fetchall() if False else rows  # placeholder per coerenza
         conn.close()
 
         data = [
@@ -287,9 +306,10 @@ async def cmd_export_json(update, context):
 
         with open(json_path, "rb") as fh:
             await update.message.reply_document(document=fh, filename=json_path.name,
-                                                caption=f"Export JSON: {json_path.name}")
+                                                caption=f"Export JSON: {json_path.name}",
+                                                protect_content=True)
     except Exception as e:
-        await update.message.reply_text(f"Errore export JSON: {e}")
+        await update.message.reply_text(f"Errore export JSON: {e}", protect_content=True)
 
 async def cmd_export_xlsx(update, context):
     if not admin_only_private(update): return
@@ -314,9 +334,10 @@ async def cmd_export_xlsx(update, context):
 
         with open(xlsx_path, "rb") as fh:
             await update.message.reply_document(document=fh, filename=xlsx_path.name,
-                                                caption=f"Export XLSX: {xlsx_path.name}")
+                                                caption=f"Export XLSX: {xlsx_path.name}",
+                                                protect_content=True)
     except Exception as e:
-        await update.message.reply_text(f"Errore export XLSX: {e}")
+        await update.message.reply_text(f"Errore export XLSX: {e}", protect_content=True)
 
 async def cmd_list(update, context):
     if not admin_only_private(update): return
@@ -326,31 +347,85 @@ async def cmd_list(update, context):
     rows = cur.fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("Nessun utente.")
+        await update.message.reply_text("Nessun utente.", protect_content=True)
         return
     msg = "\n".join(f"• {fn or '-'} @{un or '-'} (ID: {uid})" for uid,un,fn in rows)
-    for part in _chunks(msg,3800): await update.message.reply_text(part)
+    for part in _chunks(msg,3800): await update.message.reply_text(part, protect_content=True)
 
 async def cmd_broadcast(update, context):
     if not admin_only_private(update): return
     if not context.args:
-        await update.message.reply_text("Uso: /broadcast <messaggio>")
+        await update.message.reply_text("Uso: /broadcast <messaggio>", protect_content=True)
         return
     text = " ".join(context.args)
     conn = sqlite3.connect(DB_FILE)
     ids = [r[0] for r in conn.execute("SELECT user_id FROM users").fetchall()]
     conn.close()
     ok=ko=0
-    await update.message.reply_text(f"Invio a {len(ids)} utenti…")
+    await update.message.reply_text(f"Invio a {len(ids)} utenti…", protect_content=True)
     for uid in ids:
         try:
-            await context.bot.send_message(chat_id=uid, text=text)
+            await context.bot.send_message(chat_id=uid, text=text, protect_content=True)
             ok+=1
             await aio.sleep(0.03)  # rate limit dolce
         except:
             ko+=1
             await aio.sleep(0.03)
-    await update.message.reply_text(f"Broadcast finito: ✅{ok} | ❌{ko}")
+    await update.message.reply_text(f"Broadcast finito: ✅{ok} | ❌{ko}", protect_content=True)
+
+# ---------- /restore_db (admin solo privato) ----------
+async def cmd_restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only_private(update): return
+
+    msg = update.effective_message
+    if not msg or not msg.reply_to_message or not msg.reply_to_message.document:
+        await update.message.reply_text(
+            "📦 Per ripristinare:\n"
+            "1) Invia un file **.db** al bot (come documento)\n"
+            "2) Fai **Rispondi** a quel messaggio con `/restore_db`",
+            protect_content=True
+        )
+        return
+
+    doc = msg.reply_to_message.document
+    if not (doc.file_name and doc.file_name.endswith(".db")):
+        await update.message.reply_text("❌ Il file deve avere estensione .db", protect_content=True)
+        return
+
+    try:
+        Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+        tmp_path = Path(BACKUP_DIR) / f"restore_tmp_{doc.file_unique_id}.db"
+        file = await doc.get_file()
+        await file.download_to_drive(custom_path=str(tmp_path))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Errore download file: {e}", protect_content=True)
+        return
+
+    try:
+        safety_copy = Path(BACKUP_DIR) / f"pre_restore_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.bak"
+        if Path(DB_FILE).exists():
+            shutil.copy2(DB_FILE, safety_copy)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Errore copia di sicurezza: {e}", protect_content=True)
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        return
+
+    try:
+        Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(tmp_path, DB_FILE)
+        await update.message.reply_text("✅ Database ripristinato con successo. Usa /adminstatus per verificare.", protect_content=True)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Errore ripristino DB: {e}", protect_content=True)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 # ---------- AUTO-BACKUP GIORNALIERO ----------
 def _parse_hhmm(s: str) -> dtime:
@@ -375,7 +450,7 @@ async def nightly_backup_task(app: Application):
             logger.info(f"Auto-backup creato: {p}")
             if BACKUP_NOTIFY_ADMIN == "1" and ADMIN_ID:
                 try:
-                    await app.bot.send_message(chat_id=ADMIN_ID, text=f"✅ Auto-backup creato: {p.name}")
+                    await app.bot.send_message(chat_id=ADMIN_ID, text=f"✅ Auto-backup creato: {p.name}", protect_content=True)
                 except Exception as e:
                     logger.warning(f"Notify admin failed: {e}")
         except Exception as e:
@@ -426,9 +501,22 @@ def main():
     app.add_handler(CommandHandler("export_xlsx", cmd_export_xlsx))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    # default
+    app.add_handler(CommandHandler("restore_db", cmd_restore_db))
+    # blocco media non-admin (foto/video/documenti/voice/sticker/audio/gif/video_note)
+    media_filter = (
+        filters.PHOTO
+        | filters.VIDEO
+        | filters.Document.ALL
+        | filters.ANIMATION
+        | filters.STICKER
+        | filters.AUDIO
+        | filters.VOICE
+        | filters.VIDEO_NOTE
+    )
+    app.add_handler(MessageHandler(media_filter, block_media))
+    # default (testi non comando → mostra home)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
-    logger.info("SPACE420OFFICIAL avviato — anti-conflict + auto-backup.")
+    logger.info("SPACE420OFFICIAL avviato — anti-conflict + auto-backup + protect_content + restore_db.")
     run_polling_with_guard(app)
 
 if __name__ == "__main__":
